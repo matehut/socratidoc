@@ -1,0 +1,3 @@
+- Projeto Bit: bot Telegram em /root/bit, doc em artifacts/doc_bot_hot.txt [2026-08-27]
+- Pedido: integrar T3MP3ST (https://github.com/elder-plinius/T3MP3ST.git) no bot com menu/interface [2026-08-27]
+- Contrato Bit: scan passivo, anti-SSRF, allowlist, sem port scan/exploits no processo do bot [2026-08-27]

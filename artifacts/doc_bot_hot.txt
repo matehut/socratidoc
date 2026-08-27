@@ -1,0 +1,515 @@
+================================================================================
+BIT — DOCUMENTAÇÃO TÉCNICA COMPLETA (HOT)
+================================================================================
+Gerado: 2026-08-26
+Código analisado: /root/bit
+Escopo: como o bot funciona, comandos, dependências Python, fluxo de mensagens
+Nota: scan é passivo (DNS/TLS/headers). Sem port scan, dirbust, exploits.
+
+================================================================================
+1. COMO O BOT FUNCIONA
+================================================================================
+
+1.1 Visão geral
+---------------
+Bit é um bot Telegram de produção numa VPS. O processo do bot (handlers) fica
+leve: valida acesso, rate-limit, grava estado pendente no Redis e responde já.
+Trabalho pesado de rede (scan passivo, clone de site) vai para fila RQ + worker.
+
+Arquitetura em camadas:
+
+  Telegram (polling | webhook)
+        │
+        ▼
+  app/bot/          handlers, menus, teclados  (zero I/O de scan)
+        │
+        ├─ app/services/   regras: URL, scan, tools locais, acesso, jobs
+        ├─ app/adapters/   DB SQLite, Redis/RQ, httpx, sendMessage/sendDocument
+        └─ app/core/       Settings, logging JSON, exceptions
+                │
+                ▼
+             Redis ── fila RQ "scans"
+                │
+                ▼
+  app/workers/      run_scan(job_id) / clone_job
+                │
+                ▼
+             SQLite (users, jobs) + notificação ao chat via HTTP Telegram API
+
+
+1.2 Processos em runtime
+------------------------
+- bot.service  → /root/bit/run.sh → python3 -m bit.bot → app.main
+  Modo atual: TELEGRAM_MODE=polling (getUpdates).
+  Importante: NÃO pode coexistir webhook ativo no mesmo token.
+
+- worker      → python -m app.worker (RQ Worker na fila "scans")
+  Consome jobs de scan e clone; notifica o chat com adapters.telegram.
+
+- Redis       → redis://127.0.0.1:6379 (fila + pending state por chat)
+
+- webhook.service (/opt/webhook) NÃO é o receiver do Telegram.
+  É o Distiller Flask (grok-format / orchestrator) chamado pelo Bit via HTTP.
+
+
+1.3 Entrypoints
+---------------
+- bot.py          bridge: carrega env/hermes, reexec no .venv, chama app.main
+- app/main.py     Application PTB, regista handlers, set_my_commands, run_polling
+- app/worker.py   Worker RQ
+- app/cli.py      bridge para Hermes chamar tools Bit sem polling
+- run.sh          arranque systemd do bot
+
+
+1.4 Controlo de acesso
+----------------------
+app/services/access.py + Settings:
+
+- ADMIN_USER_IDS / ALLOWED_USER_IDS / ALLOWED_CHAT_IDS (lista CSV de ints)
+- BOT_PUBLIC=false → só IDs allowlist (ou admin)
+- ensure_allowed() corre em quase todos os handlers via decorator @logged
+- /exportar e /claude são restritos a admin/dono
+
+
+1.5 Configuração (app/core/config.py + .env)
+--------------------------------------------
+Principais variáveis:
+  TELEGRAM_BOT_TOKEN / BOT_TOKEN
+  TELEGRAM_MODE=polling|webhook
+  WEBHOOK_URL / WEBHOOK_LISTEN / WEBHOOK_PORT / WEBHOOK_SECRET
+  REDIS_URL, DATABASE_URL (sqlite:///./data/bot.db)
+  BIT_ALLOW_NETWORK, ALLOW_PRIVATE_TARGETS, ALLOW_NONSTANDARD_PORTS
+  RATE_LIMIT_USER_PER_HOUR, RATE_LIMIT_TARGET_COOLDOWN_SEC
+  GROK_WEBHOOK_URL, GROK_WEBHOOK_SECRET, ORCHESTRATOR_WEBHOOK_URL
+  RQ_QUEUE_NAME=scans
+
+
+1.6 Persistência e estado
+-------------------------
+- SQLite (SQLAlchemy): users, jobs (status queued/running/done/failed)
+- Redis:
+  - fila RQ
+  - pending por chat_id (tool à espera de params; TTL)
+  - rate limit / flags auxiliares
+- Logs JSON: request_id, user_id, command, job_id, duration_ms, status, error_type
+  Token NUNCA é logado (redação).
+
+
+1.7 Scan passivo (fila)
+-----------------------
+Slugs que enfileiram o mesmo worker de scan:
+  analise_site, busca_viabilidade, pentest_etico, teste_api, rastrear_ip, scan
+
+Fluxo:
+  1) Handler valida URL (http/https, anti-SSRF) + rate limit
+  2) jobs.enqueue_scan → DB job + RQ enqueue_scan_job(job_id)
+  3) Resposta imediata com job_id
+  4) Worker run_scan(job_id): DNS + TLS + HEAD/GET → format_scan_report
+  5) send_message(chat_id, summary)
+
+Clone (/clone) segue padrão semelhante com clone_job e timeout maior.
+
+
+1.8 Tools locais vs stubs
+-------------------------
+app/services/local_tools.run_local(slug, params):
+  - executa localmente: matemática, hash, conversor, senha, algumas respostas
+    estáticas/educativas (tool_answers), etc.
+  - slugs de SCAN_SLUGS são desviados para a fila
+  - teste_firewall recusa port scan de propósito
+  - muitas tools de texto/código respondem com guias/templates (não LLM embutido
+    no processo do bot, salvo integrações Hermes/Claude/webhook)
+
+
+1.9 Integrações externas
+------------------------
+- /hermes     → CLI Hermes Agent (subprocess), sem segundo poller no mesmo token
+- /claude     → Claude Code bridge (dono)
+- /webhook    → Distiller local (POST grok-format / site→JSX|HTML)
+- Lovable/Bolt scanner defensivo (headers/fingerprints públicos)
+- /tv         → CVEs públicas via NVD (relatório TXT)
+- /cam_scan   → varredura IP camera (RTSP/HTTP) — só alvos autorizados
+- /cam_snap   → captura frame (OpenCV se disponível)
+- PDF context → pypdf/pdfplumber; documento vira contexto do chat
+
+
+1.10 Conflito operacional crítico
+---------------------------------
+Um único token Telegram = um único consumidor de updates.
+Se setWebhook estiver ativo, polling (getUpdates) falha com Conflict e o bot
+fica "vivo" no systemd mas surdo. Correção: deleteWebhook + TELEGRAM_MODE=polling.
+Hermes gateway no mesmo token deve ficar desligado quando Bit faz polling
+(scripts/sync_all_telegram.py documenta isto).
+
+
+================================================================================
+2. LISTA DE COMANDOS DISPONÍVEIS
+================================================================================
+
+2.1 Comandos registados no menu Telegram (app/main.py BOT_COMMANDS)
+-------------------------------------------------------------------
+/start          Abrir menu (teclado reply)
+/tools          Lista paginada das 65 tools (inline keyboard)
+/scan <alvo>    Scan URL, domínio ou e-mail → fila passiva
+/clone <url>    Clonar site (HTML/CSS/JS + ZIP) via worker
+/exportar       Exportar dados NÃO sensíveis (admin only)
+/status         Saúde (redis/db/fila) ou /status <job_id>
+/job <id>       Alias de /status <job_id>
+/jobs           Últimos jobs do utilizador
+/history        Histórico
+/tool SLUG …    Executa tool do catálogo (ex: /tool matematica 2+2)
+/analise_site   Scan de URL/domínio (alias: /analise)
+/viabilidade    Relatório de domínio (alias: /busca_viabilidade)
+/help           Ajuda
+/lovable        Scanner defensivo Lovable/Bolt; /lovable 3 = galeria
+/pdf            PDF como contexto; /pdf limpar apaga
+/tv             Relatório público de CVEs (NVD) em TXT
+/hermes         Pedir tarefa ao Hermes Agent
+/claude         Claude Code (dono): /claude <texto>
+/webhook        Distiller ou site→JSX/HTML: /webhook jsx|html <url>
+/cam_scan       IP Camera Scan (RTSP/HTTP)
+/camera_scan    Alias Hermes → mesma lógica de /cam_scan
+/search_cam     Alias Hermes → mesma lógica de /cam_scan
+/cam_snap       Capture Frame via OpenCV
+/stop           Cancela input pendente / pending Redis
+
+
+2.2 Comandos / aliases adicionais no código
+-------------------------------------------
+/aprender       Fluxo "aprender de links" (menu)
+/extrair        Extrair texto de URL
+/tutor          Sessão tutor (pending + respostas)
+Texto livre com slug (/matematica 1+1) também resolve via resolve_slug
+
+
+2.3 Botões do teclado reply (menus.py)
+--------------------------------------
+Ferramentas | Scan | Status | Jobs | PDF | Config | Ajuda
+🤖 Criar Prompt para Grok CLI
+🔍 Relatório Sites IA
+📚 Aprender de links
+📄 Extrair Texto
+(+ labels legados: Lovable, Parcerias, Vulnerabilidades, …)
+
+
+2.4 Catálogo de tools (65) — slug | display | precisa params
+------------------------------------------------------------
+busca_web                 ▶ Buscar na web                    yes
+osint                     ▶ OSINT                            yes
+analise_site              ▶ Analisar site                    yes  [SCAN]
+busca_viabilidade         ▶ Buscar viabilidade               yes  [SCAN]
+verificacao_fatos         ▶ Verificar factos                 yes
+geolocalizacao            ▶ Geolocalização                   yes
+busca_profunda            ▶ Busca profunda                   yes
+pentest_etico             ▶ Pentest ético                    yes  [SCAN]
+ferramentas_senha         ▶ Ferramentas de senha             yes
+forense                   ▶ Forense                          yes
+teste_firewall            ▶ Teste firewall                   yes  (recusa port scan)
+analise_malware           ▶ Análise malware                  yes
+auditor_wifi              ▶ Auditor Wi-Fi                    yes
+analise_ddos              ▶ Análise DDoS                     yes
+gerador_codigo            ▶ Gerar código                     yes
+scripts_shell             ▶ Scripts shell                    yes
+engenharia_reversa        ▶ Engenharia reversa               yes
+construtor_api            ▶ Construtor de API                yes
+sql                       ▶ SQL                              yes
+webhooks_bots             ▶ Webhooks e bots                  yes
+conversor                 ▶ Conversor                        yes
+config_servidor           ▶ Config servidor                  yes
+debug_correcao            ▶ Debug e correção                 yes
+gerador_hash              ▶ Gerar hash                       yes
+teste_api                 ▶ Testar API                       yes  [SCAN]
+rastrear_ip               ▶ Rastrear IP                      yes  [SCAN]
+consulta_telefone         ▶ Consultar telefone               yes
+rastrear_email            ▶ Rastrear e-mail                  yes
+redacao                   ▶ Redação                          yes
+reescrever                ▶ Reescrever                       yes
+redes_sociais             ▶ Redes sociais                    yes
+redacao_email             ▶ Redação de e-mail                yes
+curriculo                 ▶ Currículo                        yes
+assistente_design         ▶ Assistente de design             yes
+roteiro_video             ▶ Roteiro de vídeo                 yes
+composicao_musical        ▶ Composição musical               yes
+gerador_noticias          ▶ Gerar notícia                    yes
+cotacao_cripto            ▶ Cotação cripto                   yes
+analise_mercado           ▶ Análise de mercado               yes
+cambio                    ▶ Câmbio                           yes
+planejamento_financeiro   ▶ Planeamento financeiro           yes
+tutor                     ▶ Tutor                            yes
+tradutor                  ▶ Tradutor                         yes
+resumo_texto              ▶ Resumir texto                    yes
+matematica                ▶ Matemática                       yes
+juridico                  ▶ Jurídico                         yes
+argumentacao              ▶ Argumentação                     yes
+info_saude                ▶ Info saúde                       yes
+info_medicamentos         ▶ Info medicamentos                yes
+quimica_fisica            ▶ Química e física                 yes
+monitor_saude             ▶ Monitor de saúde                 yes
+genetica                  ▶ Genética                         yes
+fisica_avancada           ▶ Física avançada                  yes
+automacoes                ▶ Automações                       yes
+ferramentas_dev           ▶ Ferramentas de dev               yes
+ferramentas_nuvem         ▶ Ferramentas de nuvem             yes
+engenharia_prompt         ▶ Engenharia de prompt             yes
+construtor_no_code        ▶ Construtor no-code               yes
+mapa_mental               ▶ Mapa mental                      yes
+acoes_rapidas             ▶ Ações rápidas                    no
+recomendacoes             ▶ Recomendações                    no
+scan                      ▶ Scan passivo                     yes  [SCAN]
+lovable                   ▶ Sites Lovable/Bolt               no
+parcerias                 ▶ Parcerias                        no
+vulnerabilidades          ▶ Vulnerabilidades                 yes
+
+
+2.5 Aliases de slug (TOOL_ALIASES)
+----------------------------------
+math/calc → matematica
+hash/hashes → gerador_hash
+email/mail → rastrear_email
+ip → rastrear_ip
+site/analise/análise/analisar/analisar_site → analise_site
+viabilidade → busca_viabilidade
+prompt → engenharia_prompt
+noticias → gerador_noticias
+tv/cve → vulnerabilidades
+pesquisar/pesquisar_na_web → busca_web
+programar → gerador_codigo
+persuasao/persuasão → argumentacao
+investigar → osint
+
+
+2.6 Callbacks inline (prefixos)
+-------------------------------
+t:<index>     tool por índice do catálogo
+p:<n>         paginação /tools
+json_*        JSON do relatório de scan
+lovable:*     galeria / modos de scan Lovable
+tv:recent|ask relatório CVE
+cfg:lang:*    idioma; cfg:pdf limpa contexto PDF
+ais:*         relatório sites IA
+ll:*          aprender de links
+gcp:*         (removido — responde mensagem de remoção)
+grok prompt actions: copy / improve / edit / cancel
+
+
+================================================================================
+3. DEPENDÊNCIAS DO PYTHON
+================================================================================
+
+3.1 Declaradas em requirements.txt (pinadas)
+--------------------------------------------
+python-telegram-bot==21.10   # Application, handlers, polling/webhook
+httpx==0.28.1                # HTTP cliente (scan, Telegram sync no worker)
+redis==5.2.1                 # broker + pending
+rq==2.1.0                    # fila de jobs
+SQLAlchemy==2.0.36           # SQLite ORM
+pydantic==2.10.5             # modelos / validação
+pydantic-settings==2.7.1     # Settings a partir de .env
+dnspython==2.7.0             # resolução DNS no scan
+tenacity==9.0.0              # retries HTTP
+pytest==8.3.4                # testes
+pypdf==5.4.0                 # PDF context
+pdfminer.six==20240706       # PDF (requirements pin; venv pode ter patch)
+pdfplumber==0.11.6           # PDF
+beautifulsoup4==4.13.4       # HTML parse (clone/extract)
+requests==2.32.4             # HTTP auxiliar
+playwright==1.49.1           # browser automation (clone/browser)
+watchdog==6.0.0              # reloader / file watch (deploy)
+
+
+3.2 Runtime observado no .venv (extras relevantes)
+--------------------------------------------------
+annotated-types, anyio, async-timeout, babel, httpx2,
+numpy, pillow, pypdfium2, pytest-cov, pydantic_core
+(+ deps transitivas do PTB/httpx/redis)
+
+Nota: OpenCV (cv2) pode ser usado por /cam_snap se instalado no ambiente;
+não está listado no requirements.txt principal.
+
+
+3.3 Serviços de sistema (não-pip)
+---------------------------------
+- Redis server
+- systemd: bot.service (+ drop-in telegram-env.conf), worker
+- Opcional: nginx + /opt/webhook (Distiller) para /webhook do Bit
+- Python 3.11 + venv em /root/bit/.venv
+
+
+3.4 Como instalar
+-----------------
+  cd /root/bit
+  python3.11 -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+  # playwright install  # se clone browser for necessário
+
+
+================================================================================
+4. FLUXO DE MENSAGENS
+================================================================================
+
+4.1 Diagrama (polling)
+----------------------
+
+  Utilizador Telegram
+        │  mensagem / callback / documento / foto
+        ▼
+  Telegram API
+        │  getUpdates (long poll)
+        ▼
+  app.main Application (concurrent_updates=True)
+        │
+        ├─ CommandHandler("*")     → cmd_*  (decorator @logged)
+        ├─ CallbackQueryHandler    → on_callback / cb_json
+        ├─ MessageHandler DOCUMENT → on_document (PDF)
+        ├─ MessageHandler PHOTO    → on_photo
+        └─ MessageHandler TEXT     → on_text
+                │
+                ▼
+        @logged / ensure_allowed
+                │
+        ┌───────┴───────────────────────────────────────────┐
+        │                                                   │
+   comando com args                              texto livre / pending
+        │                                                   │
+        ▼                                                   ▼
+  _start_tool / serviço dedicado              get_pending(chat_id)?
+        │                                         │ yes → finish tool / fluxo
+        │                                         │ no  → menu button?
+        │                                         │       slug intent?
+        │                                         │       PDF context?
+        ▼                                         ▼
+  start_tool (conversation.py)               reply
+        │
+        ├─ needs_params e params vazios → set_pending + prompt
+        ├─ SCAN_SLUGS → enqueue_scan → "job_id=…"
+        └─ senão → run_local / tool_answers / serviço
+                │
+                ▼
+           reply_text (handler)
+                │
+   [se job RQ]  │
+                ▼
+           Worker run_scan → send_message(chat_id, relatório)
+
+
+4.2 Decorator @logged (handlers.py)
+-----------------------------------
+Para cada comando:
+  1) new_request_id + bind_context(user_id, command)
+  2) init_db()
+  3) ensure_allowed(user.id)
+  4) executa handler
+  5) captura AccessDenied / RateLimitExceeded / UrlValidationError / AppError
+  6) log handler_done com duration_ms e status
+
+
+4.3 Fluxo texto (on_text) — ordem de decisão
+--------------------------------------------
+1. Acesso + init_db
+2. pending especial (GCP removido, link_learn, ai_sites, text_extract, …)
+3. match_menu_button(text) → _handle_menu
+4. pending vuln_report / grok_prompt / ai_sites / link_learn / tutor / text_extract
+5. is_awaiting (PDF a processar) → lembrete
+6. texto começa com / → resolve_slug + _start_tool  (ou PDF context)
+7. palavras soltas status/jobs/tools/… → comandos
+8. senão → handle_text (conversation: pending genérico, PDF Q&A, Claude bridge)
+
+
+4.4 Fluxo callback (on_callback)
+--------------------------------
+answer() imediato → ramo por prefixo de data:
+  json_ / grok / ai_sites / link_learn / config / tv / pdf / lovable /
+  paginação p:N / tool t:INDEX → _start_tool
+
+
+4.5 Fluxo scan (detalhado)
+--------------------------
+User: /scan https://exemplo.com
+  → cmd_scan → validação NormalizedUrl (anti-SSRF)
+  → rate_limit user + target cooldown
+  → create_job(SQLite) status=queued
+  → RQ enqueue run_scan(job_id)
+  → reply "job sXXXX …"
+Worker:
+  → mark running → run_passive_scan(url)
+  → DNS A/AAAA, TLS cert, HEAD/GET headers (httpx + tenacity)
+  → format_scan_report → mark done → send_message(chat)
+  → em falha: mark failed + mensagem segura (sem stack ao user)
+
+
+4.6 Pending Redis
+-----------------
+Quando a tool precisa de parâmetros e o user não enviou:
+  set_pending(chat_id, {tool, user_id, missing, started})
+Próxima mensagem de texto completa o pedido (finish_tool) ou /stop limpa.
+
+
+4.7 Documentos e fotos
+----------------------
+on_document: PDF → extrai texto → guarda contexto por chat (/pdf limpar)
+on_photo: caminhos auxiliares (ex. cam_snap / fluxos que aceitam imagem)
+
+
+4.8 Worker → Telegram (fora do Application)
+-------------------------------------------
+adapters/telegram.py usa httpx síncrono:
+  sendMessage / sendDocument
+Não partilha o loop asyncio do bot — adequado ao processo RQ.
+
+
+================================================================================
+5. ESTRUTURA DE PASTAS (resumo)
+================================================================================
+
+bit/
+├── bot.py, run.sh, run-worker.sh, requirements.txt, .env
+├── app/
+│   ├── main.py, worker.py, boot.py, cli.py, claude_bridge.py
+│   ├── core/        config, logging, exceptions, context
+│   ├── adapters/    db, redis, queue, http, telegram
+│   ├── bot/         handlers, menus, scan, lovable_cards
+│   ├── services/    catalog, jobs, scan, local_tools, …
+│   ├── workers/     scan_job, clone_job
+│   └── models/      url, schemas
+├── tests/
+├── deploy/
+├── scripts/sync_all_telegram.py
+└── data/bot.db
+
+
+================================================================================
+6. OPERAÇÃO RÁPIDA
+================================================================================
+
+Status:
+  systemctl status bot.service
+  systemctl status  # worker unit se existir; senão: ps aux | grep app.worker
+  journalctl -u bot.service -f
+
+Reinício bot:
+  systemctl restart bot.service
+
+Webhook Conflict (polling surdo):
+  curl -X POST "https://api.telegram.org/bot$TOKEN/deleteWebhook"
+  systemctl restart bot.service
+
+Enviar ficheiro via CLI Hermes (integração usada nesta doc):
+  hermes send --to telegram:7583853645 "MEDIA:/root/bit/doc_bot_hot.txt"
+
+
+================================================================================
+7. LIMITAÇÕES / CONTRATO DE SEGURANÇA
+================================================================================
+
+- Scan é passivo: DNS, TLS, headers, GET/HEAD. Sem exploração.
+- Anti-SSRF: bloqueia localhost, link-local, metadata cloud, file://
+- Rate limit por user/hora e cooldown por host
+- Bot privado por allowlist (salvo BOT_PUBLIC=true)
+- Export admin não inclui .env, tokens, DB completa com segredos
+- Mesmo token Telegram não pode ter Hermes gateway + Bit polling ao mesmo tempo
+
+
+================================================================================
+FIM — doc_bot_hot.txt
+================================================================================
